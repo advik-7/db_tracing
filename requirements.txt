@@ -1,0 +1,8 @@
+matplotlib
+networkx
+motor
+python-dotenv
+cairosvg
+numpy
+Pillow
+aiohttp
