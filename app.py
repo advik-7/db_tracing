@@ -23,40 +23,27 @@ import matplotlib as mpl
 from PIL import Image
 import cairosvg  # For SVG conversion
 
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 from flask import Flask, send_file
 
-# Load environment variables and MongoDB credentials
-load_dotenv()
+
 MONGO_USERNAME = os.getenv("MONGO_USERNAME")
 MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
 MONGO_HOST = os.getenv("MONGO_HOST")
-DATABASE_NAME = os.getenv("DATABASE_NAME") or "test_database"
+DATABASE_NAME = os.getenv("DATABASE_NAME")
 
-# Debug output for connection parameters (password masked)
-print("==== Database Configuration ====")
-print(f"MONGO_USERNAME: {MONGO_USERNAME}")
-print(f"MONGO_HOST: {MONGO_HOST}")
-print(f"DATABASE_NAME: {DATABASE_NAME}")
-print(f"MONGO_PASSWORD set: {'Yes' if MONGO_PASSWORD else 'No'}")
+# Encode credentials and construct the MongoDB URI
+encoded_username = quote_plus(MONGO_USERNAME)
+encoded_password = quote_plus(MONGO_PASSWORD)
+MONGO_URI = f"mongodb+srv://{encoded_username}:{encoded_password}@{MONGO_HOST}/?retryWrites=true&w=majority"
 
-# Properly encode username and password for URL
-encoded_username = quote_plus(MONGO_USERNAME) if MONGO_USERNAME else ""
-encoded_password = quote_plus(MONGO_PASSWORD) if MONGO_PASSWORD else ""
-
-# Update MongoDB URI construction
-if MONGO_HOST and MONGO_USERNAME and MONGO_PASSWORD:
-    # Standard MongoDB Atlas connection string
-    MONGO_URI = f"mongodb+srv://{encoded_username}:{encoded_password}@{MONGO_HOST}/?retryWrites=true&w=majority"
-elif MONGO_HOST:
-    # Connection string with just host (for local MongoDB with no auth)
-    MONGO_URI = f"mongodb://{MONGO_HOST}:27017"
-else:
-    # Default to localhost
-    MONGO_URI = "mongodb://localhost:27017"
-
-print(f"Using connection string: mongodb+srv://{encoded_username}:******@{MONGO_HOST}/?retryWrites=true&w=majority" 
-      if MONGO_HOST and MONGO_USERNAME and MONGO_PASSWORD else f"Using connection string: {MONGO_URI}")
-
+# Connect to MongoDB using Motor
+client = AsyncIOMotorClient(MONGO_URI)
+db = client[DATABASE_NAME]
 # Create SVG warehouse icon
 def create_warehouse_icon(color="#2C3E50"):
     svg = f"""
