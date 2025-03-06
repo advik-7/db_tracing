@@ -1,8 +1,10 @@
-matplotlib
-networkx
+Flask
+gunicorn
 motor
 python-dotenv
-cairosvg
+matplotlib
+networkx
 numpy
 Pillow
-aiohttp
+cairosvg
+pycairo
