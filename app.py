@@ -32,13 +32,30 @@ MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
 MONGO_HOST = os.getenv("MONGO_HOST")
 DATABASE_NAME = os.getenv("DATABASE_NAME") or "test_database"
 
+# Debug output for connection parameters (password masked)
+print("==== Database Configuration ====")
+print(f"MONGO_USERNAME: {MONGO_USERNAME}")
+print(f"MONGO_HOST: {MONGO_HOST}")
+print(f"DATABASE_NAME: {DATABASE_NAME}")
+print(f"MONGO_PASSWORD set: {'Yes' if MONGO_PASSWORD else 'No'}")
+
+# Properly encode username and password for URL
 encoded_username = quote_plus(MONGO_USERNAME) if MONGO_USERNAME else ""
 encoded_password = quote_plus(MONGO_PASSWORD) if MONGO_PASSWORD else ""
-MONGO_URI = (
-    f"mongodb+srv://{encoded_username}:{encoded_password}@{MONGO_HOST}/?retryWrites=true&w=majority"
-    if MONGO_HOST
-    else "mongodb://localhost:27017"
-)
+
+# Update MongoDB URI construction
+if MONGO_HOST and MONGO_USERNAME and MONGO_PASSWORD:
+    # Standard MongoDB Atlas connection string
+    MONGO_URI = f"mongodb+srv://{encoded_username}:{encoded_password}@{MONGO_HOST}/?retryWrites=true&w=majority"
+elif MONGO_HOST:
+    # Connection string with just host (for local MongoDB with no auth)
+    MONGO_URI = f"mongodb://{MONGO_HOST}:27017"
+else:
+    # Default to localhost
+    MONGO_URI = "mongodb://localhost:27017"
+
+print(f"Using connection string: mongodb+srv://{encoded_username}:******@{MONGO_HOST}/?retryWrites=true&w=majority" 
+      if MONGO_HOST and MONGO_USERNAME and MONGO_PASSWORD else f"Using connection string: {MONGO_URI}")
 
 # Create SVG warehouse icon
 def create_warehouse_icon(color="#2C3E50"):
@@ -67,7 +84,7 @@ def svg_to_image(svg_str, size=0.1):
         print(f"Error converting SVG: {e}")
     return OffsetImage(img, zoom=size)
 
-# (Optional) Custom animated arrow class is kept for completeness.
+# Custom animated arrow class
 class AnimatedArrow(FancyArrowPatch):
     def __init__(self, path, *args, **kwargs):
         self.path = path
@@ -101,22 +118,17 @@ mpl.rcParams["ytick.color"] = "white"
 
 class TransferVisualizer:
     def __init__(self):
-        try:
-            self.client = AsyncIOMotorClient(MONGO_URI)
-            self.db = self.client[DATABASE_NAME]
-            print(f"Connected to MongoDB database: {DATABASE_NAME}")
-        except Exception as e:
-            print(f"Error connecting to MongoDB: {e}")
-            self.client = None
-            self.db = None
-
+        self.client = None
+        self.db = None
+        # Initialize these first before trying DB connection
         self.fig, self.ax = plt.subplots(figsize=(16, 10), facecolor="#121212")
         self.G = nx.DiGraph()
         self.pos = None
         self.node_colors = {}
-        self.last_check_time = datetime.now() - timedelta(minutes=10)
+        self.last_check_time = datetime.now() - timedelta(minutes=30)  # Increase initial window
         self.transfers_in_progress = []
         self.update_lock = asyncio.Lock()
+        self.connection_status = "Not connected"
 
         self.event_colors = {
             "transfer_initiated": "#3498DB",
@@ -128,6 +140,46 @@ class TransferVisualizer:
         self.product_icons = {
             "default": create_warehouse_icon("#2C3E50")
         }
+        
+        # The database connection will be established in initialize()
+
+    async def connect_to_database(self):
+        """Establish connection to MongoDB with better error handling"""
+        try:
+            print(f"Attempting connection to MongoDB at: {MONGO_URI}")
+            self.client = AsyncIOMotorClient(
+                MONGO_URI,
+                serverSelectionTimeoutMS=5000,  # 5 second timeout
+                connectTimeoutMS=5000,
+                socketTimeoutMS=5000
+            )
+            
+            # Test the connection immediately
+            await self.client.admin.command('ping')
+            self.db = self.client[DATABASE_NAME]
+            
+            # Further validation - check we can list collections
+            collections = await self.db.list_collection_names()
+            print(f"Successfully connected to MongoDB. Available collections: {collections}")
+            
+            self.connection_status = "Connected"
+            return True
+        except Exception as e:
+            self.connection_status = f"Failed: {str(e)}"
+            print(f"Error connecting to MongoDB: {e}")
+            print(f"Error type: {type(e).__name__}")
+            
+            # Additional network diagnostics
+            if "timed out" in str(e).lower():
+                print("Connection timed out - possible network or firewall issue")
+            elif "unauthorized" in str(e).lower():
+                print("Authentication failed - check username and password")
+            elif "server selection" in str(e).lower():
+                print("Server selection failed - check hostname and network")
+                
+            self.client = None
+            self.db = None
+            return False
 
     async def get_recent_events(self):
         if self.db is None:
@@ -136,22 +188,13 @@ class TransferVisualizer:
         try:
             query = {"timestamp": {"$gt": self.last_check_time}}
             print(f"Fetching events with query: {query}")
+            
+            # First check if collection exists
             collections = await self.db.list_collection_names()
-            print(f"Available collections: {collections}")
             if "transfer_trace" not in collections:
                 print("Warning: transfer_trace collection does not exist")
-                try:
-                    await self.db.transfer_trace.insert_one({
-                        "from": "test_source",
-                        "to": "test_destination",
-                        "event": "transfer_initiated",
-                        "product_field": "test_product",
-                        "quantity": "10",
-                        "timestamp": datetime.now(),
-                    })
-                    print("Created test document in transfer_trace collection")
-                except Exception as e:
-                    print(f"Error creating test document: {e}")
+                return []
+                
             events = await self.db.transfer_trace.find(query).sort("timestamp", 1).to_list(length=None)
             print(f"Found {len(events)} recent events")
             if events:
@@ -166,10 +209,13 @@ class TransferVisualizer:
             print("Database connection not available")
             return []
         try:
+            # First check if collection exists
             collections = await self.db.list_collection_names()
             print(f"Available collections: {collections}")
+            
             if "transfer_trace" not in collections:
                 print("Warning: transfer_trace collection does not exist")
+                print("Creating transfer_trace collection with sample data")
                 try:
                     test_data = [
                         {
@@ -201,6 +247,8 @@ class TransferVisualizer:
                     print("Created test documents in transfer_trace collection")
                 except Exception as e:
                     print(f"Error creating test documents: {e}")
+                    
+            # Now try to fetch events
             events = await self.db.transfer_trace.find().sort("timestamp", 1).to_list(length=None)
             print(f"Found {len(events)} total events")
             if events:
@@ -294,20 +342,35 @@ class TransferVisualizer:
 
     def clear_visualization(self):
         self.ax.clear()
-        self.G.clear()  # Optionally reset the graph
-        self.transfers_in_progress = []
+        self.ax.set_axis_off()
 
     def draw_static_elements(self):
+        # Show connection status
+        if self.connection_status != "Connected":
+            status_color = "#E74C3C"  # Red for error
+            status_text = f"Database: {self.connection_status}"
+        else:
+            status_color = "#2ECC71"  # Green for connected
+            status_text = "Database: Connected"
+            
+        self.ax.text(0.02, 0.98, status_text, 
+                     transform=self.ax.transAxes,
+                     fontsize=10, color=status_color,
+                     verticalalignment='top',
+                     bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.7))
+        
         if not self.G.nodes():
             self.ax.text(0.5, 0.5, "No transfer events found in the database",
                          ha="center", va="center", fontsize=14)
             return
+            
         if not self.pos or len(self.pos) != len(self.G.nodes()):
             try:
                 self.pos = nx.spring_layout(self.G, k=0.5, iterations=100)
             except Exception as e:
                 print(f"Error calculating layout: {e}")
                 return
+                
         try:
             for u, v, data in self.G.edges(data=True):
                 edge_color = self.event_colors.get(data.get("event_type", "default"), self.event_colors["default"])
@@ -316,6 +379,7 @@ class TransferVisualizer:
                                        connectionstyle="arc3,rad=0.2")
         except Exception as e:
             print(f"Error drawing edges: {e}")
+            
         try:
             for node in self.G.nodes():
                 color = self.node_colors.get(node, "#3498DB")
@@ -329,9 +393,10 @@ class TransferVisualizer:
                                            edgecolor=color, linewidth=2))
         except Exception as e:
             print(f"Error drawing nodes: {e}")
+            
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.ax.set_title(f"Real-Time Database Transfer Visualization\n{now}", fontsize=16)
-        self.ax.set_axis_off()
+        
         try:
             legend_elements = [
                 Line2D([0], [0], color=color, lw=4, label=event_type.replace('_', ' ').title())
@@ -389,43 +454,42 @@ class TransferVisualizer:
             return []
 
     async def async_update(self):
+        """Background task to fetch new events and update visualization"""
+        retry_count = 0
         while True:
             try:
-                async with self.update_lock:
-                    events = await self.get_recent_events()
-                    if events:
-                        print(f"Retrieved {len(events)} new events")
-                        self.update_graph(events)
+                # If we don't have a DB connection, try to reconnect periodically
+                if self.db is None:
+                    retry_count += 1
+                    if retry_count % 10 == 0:  # Try reconnecting every 10th attempt
+                        print(f"Attempting to reconnect to database (attempt {retry_count//10})")
+                        await self.connect_to_database()
+                
+                # Only try to fetch events if we have a connection
+                if self.db is not None:
+                    async with self.update_lock:
+                        events = await self.get_recent_events()
+                        if events:
+                            print(f"Retrieved {len(events)} new events")
+                            self.update_graph(events)
+                
                 await asyncio.sleep(1)
             except Exception as e:
                 print(f"Error in async_update: {e}")
                 await asyncio.sleep(5)
 
     async def initialize(self):
+        """Initialize the visualizer and establish database connection"""
         try:
             print("Starting initialization...")
-            print(f"MongoDB URI: {MONGO_URI}")
-            print(f"Database name: {DATABASE_NAME}")
-            if self.db is None:
-                print("Database connection not available")
-                self.ax.text(0.5, 0.5, "Database connection not available",
-                             ha="center", va="center", fontsize=14)
-                return
-            try:
-                server_info = await self.client.server_info()
-                print(f"Connected to MongoDB version: {server_info.get('version', 'unknown')}")
-            except Exception as e:
-                print(f"Could not get server info: {e}")
-            events = await self.get_all_events()
-            if events:
-                print(f"Retrieved {len(events)} initial events")
-                self.update_graph(events)
-                self.draw_static_elements()
-            else:
-                print("No events found in the database, or collection is empty")
-                self.ax.text(0.5, 0.5, "No transfer events found in the database",
-                             ha="center", va="center", fontsize=14)
-                print("Creating mock data for visualization testing...")
+            
+            # Try to connect to the database
+            connected = await self.connect_to_database()
+            
+            if not connected:
+                print("Failed to connect to database, setting up with demo data")
+                self.connection_status = "Not connected - using demo data"
+                # Create mock data since we don't have a database
                 mock_events = [
                     {
                         "from": "Warehouse A",
@@ -443,13 +507,97 @@ class TransferVisualizer:
                         "quantity": "50",
                         "timestamp": datetime.now() - timedelta(hours=1),
                     },
+                    {
+                        "from": "Warehouse A",
+                        "to": "Store 3",
+                        "event": "transfer_initiated",
+                        "product_field": "Product Z",
+                        "quantity": "75",
+                        "timestamp": datetime.now() - timedelta(minutes=30),
+                    },
                 ]
                 self.update_graph(mock_events)
+                self.draw_static_elements()
+                return
+            
+            # If connected, try to get events from the database
+            events = await self.get_all_events()
+            if events:
+                print(f"Retrieved {len(events)} initial events")
+                self.update_graph(events)
+                self.draw_static_elements()
+            else:
+                print("No events found in the database, creating demo data")
+                self.ax.text(0.5, 0.5, "No transfer events found in the database, initializing with demo data",
+                            ha="center", va="center", fontsize=14)
+                
+                # If database exists but no data, create some test data
+                if self.db is not None:
+                    try:
+                        print("Creating sample data for visualization...")
+                        test_data = [
+                            {
+                                "from": "Warehouse A",
+                                "to": "Store 1",
+                                "event": "transfer_completed",
+                                "product_field": "Product X",
+                                "quantity": "100",
+                                "timestamp": datetime.now() - timedelta(hours=2),
+                            },
+                            {
+                                "from": "Warehouse B",
+                                "to": "Store 2",
+                                "event": "transfer_in_progress",
+                                "product_field": "Product Y",
+                                "quantity": "50",
+                                "timestamp": datetime.now() - timedelta(hours=1),
+                            },
+                        ]
+                        await self.db.transfer_trace.insert_many(test_data)
+                        print("Created sample data successfully")
+                        events = await self.get_all_events()
+                        self.update_graph(events)
+                    except Exception as e:
+                        print(f"Error creating sample data: {e}")
+                        # Fall back to local visualization with mock data
+                        mock_events = [
+                            {
+                                "from": "Warehouse A",
+                                "to": "Store 1",
+                                "event": "transfer_completed",
+                                "product_field": "Product X",
+                                "quantity": "100",
+                                "timestamp": datetime.now() - timedelta(hours=2),
+                            },
+                            {
+                                "from": "Warehouse B",
+                                "to": "Store 2",
+                                "event": "transfer_in_progress",
+                                "product_field": "Product Y",
+                                "quantity": "50",
+                                "timestamp": datetime.now() - timedelta(hours=1),
+                            },
+                        ]
+                        self.update_graph(mock_events)
+                
                 self.draw_static_elements()
         except Exception as e:
             print(f"Error initializing: {e}")
             self.ax.text(0.5, 0.5, f"Error initializing visualization: {e}",
-                         ha="center", va="center", fontsize=14)
+                        ha="center", va="center", fontsize=14)
+            # Always show something, even on error
+            mock_events = [
+                {
+                    "from": "Error State",
+                    "to": "Visualization Demo",
+                    "event": "transfer_failed",
+                    "product_field": "System Status",
+                    "quantity": "N/A",
+                    "timestamp": datetime.now() - timedelta(hours=2),
+                }
+            ]
+            self.update_graph(mock_events)
+            self.draw_static_elements()
 
 # ----- Flask Web Service -----
 
@@ -466,10 +614,50 @@ def index():
       <head>
         <title>Real-Time Database Transfer Visualization</title>
         <meta http-equiv="refresh" content="5">
+        <style>
+          body {
+            font-family: Arial, sans-serif;
+            background-color: #121212;
+            color: white;
+            text-align: center;
+            padding: 20px;
+          }
+          h1 {
+            margin-bottom: 20px;
+          }
+          .visualization {
+            max-width: 100%;
+            margin: 0 auto;
+            border: 1px solid #333;
+            box-shadow: 0 0 10px rgba(0,0,0,0.5);
+          }
+          .status {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #1e1e1e;
+            border-radius: 5px;
+            display: inline-block;
+          }
+        </style>
       </head>
       <body>
         <h1>Real-Time Database Transfer Visualization</h1>
-        <img src="/image" alt="Visualization">
+        <div class="visualization">
+          <img src="/image" alt="Visualization">
+        </div>
+        <div class="status">
+          Database Status: <span id="status">Checking...</span>
+          <br>
+          Auto-refreshing every 5 seconds
+        </div>
+        <script>
+          // Update the status from a status endpoint (could be implemented)
+          function updateStatus() {
+            document.getElementById("status").innerText = 
+              "See visualization for current status";
+          }
+          setTimeout(updateStatus, 1000);
+        </script>
       </body>
     </html>
     """
@@ -480,9 +668,14 @@ def image():
     # Redraw the current visualization and return it as a PNG image.
     visualizer.redraw()
     buf = io.BytesIO()
-    visualizer.fig.savefig(buf, format="png", bbox_inches="tight")
+    visualizer.fig.savefig(buf, format="png", bbox_inches="tight", dpi=100)
     buf.seek(0)
     return send_file(buf, mimetype="image/png")
+
+@app.route("/status")
+def status():
+    # Optional endpoint to get connection status
+    return {"status": visualizer.connection_status}
 
 # ----- Start Background Async Loop -----
 def start_background_loop(loop):
@@ -499,4 +692,4 @@ asyncio.run_coroutine_threadsafe(visualizer.async_update(), background_loop)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)
